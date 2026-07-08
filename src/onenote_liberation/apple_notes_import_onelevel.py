@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """One-level Apple Notes importer using literal AppleScript folder names.
 
-Apple Notes' AppleScript support behaves differently when folder names are
-passed via argv or when a long script is passed via osascript -e. This importer
-generates a temporary .applescript file and runs that file, matching the probe
-that works reliably on macOS Notes:
+This importer writes a temporary .applescript file and runs that file, because
+Apple Notes folder references are more reliable that way than via osascript -e.
 
-    Root > "Section Group - Section" > Note
+Layout:
+    Account > Root > "Section Group - Section" > Note
 """
 
 from __future__ import annotations
@@ -45,7 +44,6 @@ def one_level_folder_for_item(item: flat.ImportItem) -> str:
 
 
 def applescript_string(value: str) -> str:
-    # AppleScript string literal. Backslash must be escaped before quotes.
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 
@@ -84,7 +82,13 @@ def run_osascript_file(script: str, args: list[str], keep_script: bool = False) 
             pass
 
 
-def import_one_item(item: flat.ImportItem, root_folder: str, attach_assets: bool, keep_scripts: bool) -> None:
+def import_one_item(
+    item: flat.ImportItem,
+    root_folder: str,
+    account_name: str,
+    attach_assets: bool,
+    keep_scripts: bool,
+) -> None:
     if not item.html_path.exists():
         raise FileNotFoundError(f"HTML file not found: {item.html_path}")
 
@@ -95,6 +99,7 @@ def import_one_item(item: flat.ImportItem, root_folder: str, attach_assets: bool
     if attach_assets:
         normalised_paths = [normalised_attachment_copy(path) for path in item.asset_paths]
 
+    account_literal = applescript_string(account_name)
     root_literal = applescript_string(root_folder)
     child_literal = applescript_string(child_folder)
 
@@ -106,7 +111,7 @@ on run argv
 
     tell application "Notes"
         activate
-        set a to first account
+        set a to account {account_literal}
 
         if not (exists folder {root_literal} of a) then
             make new folder at a with properties {{name:{root_literal}}}
@@ -149,31 +154,34 @@ end run
             pass
 
 
-def destination_for_item(item: flat.ImportItem, root_folder: str) -> str:
-    return " / ".join([root_folder, one_level_folder_for_item(item)])
+def destination_for_item(item: flat.ImportItem, root_folder: str, account_name: str) -> str:
+    return " / ".join([account_name, root_folder, one_level_folder_for_item(item)])
 
 
-def print_plan(items: list[flat.ImportItem], root_folder: str, attach_assets: bool) -> None:
+def print_plan(items: list[flat.ImportItem], root_folder: str, account_name: str, attach_assets: bool) -> None:
     print(f"Notes selected: {len(items)}")
     print("Hierarchy mode: one-level-applescript-file")
+    print(f"Apple Notes account: {account_name}")
     for item in items:
         asset_text = f", {flat.asset_summary(item.asset_paths)}" if attach_assets else ""
-        print(f"- {item.title} -> {destination_for_item(item, root_folder)}{asset_text}")
+        print(f"- {item.title} -> {destination_for_item(item, root_folder, account_name)}{asset_text}")
         print(f"  {item.metadata_path}")
 
 
 def import_items(
     items: list[flat.ImportItem],
     root_folder: str,
+    account_name: str,
     delay: float,
     attach_assets: bool,
     keep_scripts: bool,
 ) -> None:
     for index, item in enumerate(items, start=1):
-        print(f"[{index}/{len(items)}] Importing: {item.title} -> {destination_for_item(item, root_folder)}")
+        print(f"[{index}/{len(items)}] Importing: {item.title} -> {destination_for_item(item, root_folder, account_name)}")
         import_one_item(
             item,
             root_folder=root_folder,
+            account_name=account_name,
             attach_assets=attach_assets,
             keep_scripts=keep_scripts,
         )
@@ -185,6 +193,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Import OneNote Liberation export into one-level Apple Notes folders.")
     parser.add_argument("input", help="Path to either a .metadata.json file or an export directory.")
     parser.add_argument("--folder", default=DEFAULT_FOLDER, help="Apple Notes root folder.")
+    parser.add_argument("--account", required=True, help="Apple Notes account name. List accounts with: osascript -e 'tell application \"Notes\" to get name of every account'")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--delay", type=float, default=0.2)
     parser.add_argument("--no-attach-assets", action="store_true")
@@ -203,7 +212,7 @@ def main() -> None:
         print("No metadata files found.")
         return
 
-    print_plan(items, root_folder=args.folder, attach_assets=attach_assets)
+    print_plan(items, root_folder=args.folder, account_name=args.account, attach_assets=attach_assets)
     if args.dry_run:
         print("Dry run only. Nothing was written to Apple Notes.")
         return
@@ -211,6 +220,7 @@ def main() -> None:
     import_items(
         items,
         root_folder=args.folder,
+        account_name=args.account,
         delay=args.delay,
         attach_assets=attach_assets,
         keep_scripts=args.keep_scripts,
