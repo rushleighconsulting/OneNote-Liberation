@@ -2,9 +2,9 @@
 """Hierarchy-aware Apple Notes importer.
 
 Modes:
-- nested: attempts true Apple Notes nested folders using the proven local
-  AppleScript pattern.
-- path: safe fallback using flattened path folders.
+- one-level: supported mode. Creates Root > "Section Group - Section" > Note.
+- nested: experimental true nested folders.
+- path: safe fallback using flattened top-level path folders.
 """
 
 from __future__ import annotations
@@ -41,6 +41,13 @@ def flattened_folder_for_item(item: flat.ImportItem, root_folder: str) -> str:
     return safe_part(f"{root_folder} - {' - '.join(parts)}")
 
 
+def one_level_folder_for_item(item: flat.ImportItem) -> str:
+    parts = folder_path_for_item(item)
+    if not parts:
+        return "Unfiled"
+    return safe_part(" - ".join(parts))
+
+
 def run_osascript(script: str, args: list[str]) -> None:
     completed = subprocess.run(
         ["osascript", "-e", script, *args],
@@ -59,6 +66,74 @@ def run_osascript(script: str, args: list[str]) -> None:
 def import_one_item_path(item: flat.ImportItem, root_folder: str, attach_assets: bool) -> None:
     item.destination_folder = flattened_folder_for_item(item, root_folder)
     flat.import_one_item(item, attach_assets=attach_assets)
+
+
+def import_one_item_one_level(item: flat.ImportItem, root_folder: str, attach_assets: bool) -> None:
+    if not item.html_path.exists():
+        raise FileNotFoundError(f"HTML file not found: {item.html_path}")
+
+    prepared_html = flat.prepare_html_for_apple_notes(item.html_path)
+    child_folder = one_level_folder_for_item(item)
+
+    normalised_paths: list[pathlib.Path] = []
+    if attach_assets:
+        normalised_paths = [normalised_attachment_copy(path) for path in item.asset_paths]
+
+    script = r'''
+on run argv
+    set noteTitle to item 1 of argv
+    set htmlPath to item 2 of argv
+    set rootFolderName to item 3 of argv
+    set childFolderName to item 4 of argv
+
+    set noteBody to read POSIX file htmlPath as «class utf8»
+
+    tell application "Notes"
+        activate
+        set a to first account
+
+        if not (exists folder rootFolderName of a) then
+            make new folder at a with properties {name:rootFolderName}
+        end if
+
+        set r to folder rootFolderName of a
+
+        if not (exists folder childFolderName of r) then
+            make new folder at r with properties {name:childFolderName}
+        end if
+
+        set targetFolder to folder childFolderName of r
+        set newNote to make new note at targetFolder with properties {name:noteTitle, body:noteBody}
+
+        if (count of argv) ≥ 5 then
+            repeat with i from 5 to count of argv
+                set attachmentPath to item i of argv
+                try
+                    make new attachment at newNote with data (POSIX file attachmentPath as alias)
+                on error errMsg number errNum
+                    set body of newNote to ((body of newNote) & "<p><strong>Asset attachment failed:</strong> " & attachmentPath & " (" & errMsg & ")</p>")
+                end try
+            end repeat
+        end if
+    end tell
+end run
+'''
+
+    args = [
+        item.title,
+        str(prepared_html),
+        root_folder,
+        child_folder,
+        *[str(path) for path in normalised_paths],
+    ]
+
+    try:
+        run_osascript(script, args)
+    finally:
+        try:
+            prepared_html.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def import_one_item_nested(item: flat.ImportItem, root_folder: str, attach_assets: bool) -> None:
@@ -143,6 +218,8 @@ end run
 def destination_for_item(item: flat.ImportItem, root_folder: str, mode: str) -> str:
     if mode == "nested":
         return " / ".join([root_folder, *folder_path_for_item(item)])
+    if mode == "one-level":
+        return " / ".join([root_folder, one_level_folder_for_item(item)])
     return flattened_folder_for_item(item, root_folder)
 
 
@@ -168,6 +245,8 @@ def import_items(
         print(f"[{index}/{len(items)}] Importing: {item.title} -> {destination}")
         if mode == "nested":
             import_one_item_nested(item, root_folder=root_folder, attach_assets=attach_assets)
+        elif mode == "one-level":
+            import_one_item_one_level(item, root_folder=root_folder, attach_assets=attach_assets)
         else:
             import_one_item_path(item, root_folder=root_folder, attach_assets=attach_assets)
         if delay > 0 and index < len(items):
@@ -178,7 +257,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Import OneNote Liberation export into Apple Notes hierarchy folders.")
     parser.add_argument("input", help="Path to either a .metadata.json file or an export directory.")
     parser.add_argument("--folder", default=DEFAULT_FOLDER, help="Apple Notes root folder.")
-    parser.add_argument("--mode", choices=["nested", "path"], default="nested")
+    parser.add_argument("--mode", choices=["one-level", "nested", "path"], default="one-level")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--delay", type=float, default=0.2)
     parser.add_argument("--no-attach-assets", action="store_true")
