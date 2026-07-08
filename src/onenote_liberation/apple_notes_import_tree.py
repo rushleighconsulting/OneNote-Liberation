@@ -63,6 +63,17 @@ def import_one_item_tree(item: flat.ImportItem, root_folder: str, attach_assets:
         normalised_paths = [normalised_attachment_copy(path) for path in item.asset_paths]
 
     script = r'''
+on findChildFolder(parentContainer, childName)
+    tell application "Notes"
+        repeat with candidateFolder in folders of parentContainer
+            if name of candidateFolder is childName then
+                return candidateFolder
+            end if
+        end repeat
+        return missing value
+    end tell
+end findChildFolder
+
 on run argv
     set noteTitle to item 1 of argv
     set htmlPath to item 2 of argv
@@ -75,18 +86,27 @@ on run argv
         activate
         set targetAccount to first account
 
-        if not (exists folder rootFolderName of targetAccount) then
-            make new folder at targetAccount with properties {name:rootFolderName}
+        set rootFolder to missing value
+        repeat with candidateFolder in folders of targetAccount
+            if name of candidateFolder is rootFolderName then
+                set rootFolder to candidateFolder
+                exit repeat
+            end if
+        end repeat
+
+        if rootFolder is missing value then
+            set rootFolder to make new folder at targetAccount with properties {name:rootFolderName}
         end if
 
-        set currentContainer to folder rootFolderName of targetAccount
+        set currentContainer to rootFolder
 
         repeat with i from 1 to folderCount
             set childName to item (4 + i) of argv
-            if not (exists folder childName of currentContainer) then
-                make new folder at currentContainer with properties {name:childName}
+            set childFolder to my findChildFolder(currentContainer, childName)
+            if childFolder is missing value then
+                set childFolder to make new folder at currentContainer with properties {name:childName}
             end if
-            set currentContainer to folder childName of currentContainer
+            set currentContainer to childFolder
         end repeat
 
         set attachmentStart to 5 + folderCount
