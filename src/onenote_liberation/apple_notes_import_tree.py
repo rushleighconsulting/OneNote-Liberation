@@ -2,13 +2,9 @@
 """Hierarchy-aware Apple Notes importer.
 
 Modes:
-- nested: attempts true Apple Notes nested folders.
+- nested: attempts true Apple Notes nested folders using the proven local
+  AppleScript pattern.
 - path: safe fallback using flattened path folders.
-
-The path mode preserves context without relying on fragile nested-folder
-AppleScript behaviour. The nested mode is experimental because Apple Notes'
-AppleScript support for child folders is inconsistent across accounts/macOS
-versions.
 """
 
 from __future__ import annotations
@@ -87,24 +83,30 @@ on run argv
 
     tell application "Notes"
         activate
-        set targetAccount to first account
+        set a to first account
 
-        if not (exists folder rootFolderName of targetAccount) then
-            make new folder at targetAccount with properties {name:rootFolderName}
+        if not (exists folder rootFolderName of a) then
+            make new folder at a with properties {name:rootFolderName}
         end if
 
-        set currentContainer to folder rootFolderName of targetAccount
+        set r to folder rootFolderName of a
 
-        repeat with i from 1 to folderCount
-            set childName to item (4 + i) of argv
-            if not (exists folder childName of currentContainer) then
-                make new folder at currentContainer with properties {name:childName}
-            end if
-            set currentContainer to folder childName of currentContainer
-        end repeat
+        if folderCount is 0 then
+            set targetFolder to r
+        else
+            set currentFolder to r
+            repeat with i from 1 to folderCount
+                set childName to item (4 + i) of argv
+                if not (exists folder childName of currentFolder) then
+                    make new folder at currentFolder with properties {name:childName}
+                end if
+                set currentFolder to folder childName of currentFolder
+            end repeat
+            set targetFolder to currentFolder
+        end if
 
         set attachmentStart to 5 + folderCount
-        set newNote to make new note at currentContainer with properties {name:noteTitle, body:noteBody}
+        set newNote to make new note at targetFolder with properties {name:noteTitle, body:noteBody}
 
         if (count of argv) ≥ attachmentStart then
             repeat with i from attachmentStart to count of argv
