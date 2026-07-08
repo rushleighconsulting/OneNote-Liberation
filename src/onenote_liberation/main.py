@@ -10,13 +10,8 @@ Current capabilities:
 - Local HTML export
 - Nested index.html
 - Local image download and HTML rewrite
+- Per-page metadata JSON
 - Sensitive-looking sections/pages skipped by default
-
-Run:
-    python -m onenote_liberation
-
-Include sensitive sections deliberately:
-    python -m onenote_liberation --include-sensitive
 """
 
 from __future__ import annotations
@@ -39,6 +34,7 @@ import requests
 from bs4 import BeautifulSoup
 
 
+VERSION = "0.5.0"
 CLIENT_ID = "5e754056-cd85-4272-bea0-ab1696b2f92e"
 AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = ["Notes.Read"]
@@ -293,7 +289,6 @@ def clean_onenote_html(
         tag.decompose()
 
     images = download_and_rewrite_images(token, soup, page_output_path, page_id, paths)
-
     body_content = soup.body.decode_contents() if soup.body else str(soup)
     safe_title = html.escape(title or "Untitled")
 
@@ -333,12 +328,46 @@ pre, code {{
 </head>
 <body>
 <h1>{safe_title}</h1>
-<div class="meta">Exported from OneNote by OneNote Liberation</div>
+<div class="meta">Exported from OneNote by OneNote Liberation {VERSION}</div>
 {body_content}
 </body>
 </html>
 """
     return cleaned, images
+
+
+def make_page_metadata(
+    page: dict[str, Any],
+    title: str,
+    page_id: str,
+    path_parts: list[str],
+    html_path: pathlib.Path,
+    paths: ExportPaths,
+    images: list[dict[str, Any]],
+) -> dict[str, Any]:
+    notebook = path_parts[0] if path_parts else None
+    section = path_parts[-1] if path_parts else None
+    section_groups = path_parts[1:-1] if len(path_parts) > 2 else []
+
+    return {
+        "tool": "OneNote Liberation",
+        "tool_version": VERSION,
+        "title": title,
+        "onenote_page_id": page_id,
+        "created": page.get("createdDateTime"),
+        "modified": page.get("lastModifiedDateTime"),
+        "hierarchy": {
+            "notebook": notebook,
+            "section_groups": section_groups,
+            "section": section,
+            "path_parts": path_parts,
+        },
+        "files": {
+            "html": str(html_path.relative_to(paths.root)),
+            "metadata": str(html_path.with_suffix(".metadata.json").relative_to(paths.root)),
+        },
+        "images": images,
+    }
 
 
 def export_page(
@@ -357,6 +386,7 @@ def export_page(
             "title": title,
             "id": page_id,
             "path": None,
+            "metadata_path": None,
             "skipped": True,
             "reason": "sensitive-looking path/title",
             "images": [],
@@ -379,6 +409,10 @@ def export_page(
     cleaned, images = clean_onenote_html(token, raw, title, output_path, page_id, paths)
     output_path.write_text(cleaned, encoding="utf-8")
 
+    metadata = make_page_metadata(page, title, page_id, path_parts, output_path, paths, images)
+    metadata_path = output_path.with_suffix(".metadata.json")
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
     if images:
         downloaded_count = sum(1 for item in images if item.get("status") == "downloaded")
         print(f"        images: {downloaded_count}/{len(images)} downloaded")
@@ -387,8 +421,11 @@ def export_page(
         "title": title,
         "id": page_id,
         "path": str(output_path.relative_to(paths.root)),
+        "metadata_path": str(metadata_path.relative_to(paths.root)),
         "skipped": False,
         "reason": None,
+        "created": page.get("createdDateTime"),
+        "modified": page.get("lastModifiedDateTime"),
         "images": images,
     }
 
@@ -439,6 +476,7 @@ def export_section(
                         "title": page.get("title"),
                         "id": page.get("id"),
                         "path": None,
+                        "metadata_path": None,
                         "skipped": False,
                         "reason": f"Export error: {exc}",
                         "images": [],
@@ -570,8 +608,16 @@ def render_section(section: dict[str, Any]) -> str:
             elif page.get("path"):
                 href = html.escape(page["path"])
                 image_count = len(page.get("images") or [])
+                metadata_path = page.get("metadata_path")
+                metadata_link = (
+                    f' <a href="{html.escape(metadata_path)}"><small>metadata</small></a>'
+                    if metadata_path
+                    else ""
+                )
                 suffix = f" — {image_count} image(s)" if image_count else ""
-                output.append(f'<li><a href="{href}">{title}</a>{html.escape(suffix)}</li>')
+                output.append(
+                    f'<li><a href="{href}">{title}</a>{html.escape(suffix)}{metadata_link}</li>'
+                )
             else:
                 reason = html.escape(page.get("reason") or "not exported")
                 output.append(f"<li>{title} <em>({reason})</em></li>")
@@ -645,6 +691,9 @@ li {{
 em {{
     color: #666;
 }}
+small {{
+    color: #666;
+}}
 </style>
 </head>
 <body>
@@ -681,7 +730,7 @@ def main() -> None:
     paths = ExportPaths(root=pathlib.Path(args.output))
     paths.create()
 
-    print("OneNote Liberation")
+    print(f"OneNote Liberation {VERSION}")
     print("Read-only OneNote HTML exporter")
     print("-----------------------------------")
 
@@ -702,8 +751,8 @@ def main() -> None:
 
     report: dict[str, Any] = {
         "tool": "OneNote Liberation",
-        "version": "0.4.0",
-        "purpose": "Read-only OneNote HTML export with hierarchy and images",
+        "version": VERSION,
+        "purpose": "Read-only OneNote HTML export with hierarchy, images, and metadata",
         "include_sensitive": args.include_sensitive,
         "notebooks": [],
     }
