@@ -1,8 +1,9 @@
 """Patched exporter entry point.
 
-This keeps the original fast-moving prototype exporter intact while patching
-asset saving so downloaded resources get correct file extensions based on
-magic-byte detection rather than weak Microsoft Graph Content-Type headers.
+This keeps the original fast-moving prototype exporter intact while patching:
+- asset saving so downloaded resources get correct file extensions based on
+  magic-byte detection rather than weak Microsoft Graph Content-Type headers
+- section page fetching so large sections are not accidentally capped at 20 pages
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from . import main as legacy
 from .assets import detect_from_bytes
 
 
-VERSION = "0.12.0"
+VERSION = "0.13.2"
 legacy.VERSION = VERSION
 
 
@@ -103,5 +104,70 @@ def download_and_rewrite_images(
     return downloaded
 
 
+def export_section(
+    token: str,
+    section: dict[str, Any],
+    path_parts: list[str],
+    options: Any,
+    paths: Any,
+) -> dict[str, Any]:
+    section_name = section.get("displayName", "Untitled section")
+    section_id = section["id"]
+    current_path = path_parts + [section_name]
+
+    print(f"    Section: {section_name}")
+
+    result: dict[str, Any] = {
+        "type": "section",
+        "name": section_name,
+        "id": section_id,
+        "path": current_path,
+        "pages": [],
+        "error": None,
+    }
+
+    if not legacy.section_matches_filter(current_path, options):
+        print("      SKIP section filter")
+        result["error"] = "Skipped by section filter"
+        return result
+
+    if legacy.looks_sensitive(current_path) and not options.include_sensitive:
+        print("      SKIP sensitive-looking section")
+        result["error"] = "Skipped sensitive-looking section"
+        return result
+
+    try:
+        pages = legacy.get_all_values(
+            token,
+            f"/me/onenote/sections/{section_id}/pages?$top=100&$select=id,title,createdDateTime,lastModifiedDateTime",
+            options,
+            label="pages",
+        )
+
+        for page in pages:
+            try:
+                result["pages"].append(legacy.export_page(token, page, current_path, options, paths))
+            except Exception as exc:
+                print(f"      ERROR exporting page {page.get('title')}: {exc}")
+                result["pages"].append(
+                    {
+                        "title": page.get("title"),
+                        "id": page.get("id"),
+                        "path": None,
+                        "metadata_path": None,
+                        "skipped": False,
+                        "reason": f"Export error: {exc}",
+                        "images": [],
+                    }
+                )
+
+    except Exception as exc:
+        print(f"      ERROR reading section: {exc}")
+        result["error"] = str(exc)
+
+    return result
+
+
 legacy.download_and_rewrite_images = download_and_rewrite_images
+legacy.export_section = export_section
 main = legacy.main
