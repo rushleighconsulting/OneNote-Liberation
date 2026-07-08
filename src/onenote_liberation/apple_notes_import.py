@@ -1,31 +1,52 @@
 #!/usr/bin/env python3
 """
-Apple Notes proof-of-concept importer.
+Apple Notes importer.
 
-This imports one exported OneNote Liberation page, identified by its
-.metadata.json file, into a single Apple Notes folder.
+Current scope:
+- import one exported page from a .metadata.json file
+- import every page in an export directory
+- optional dry run
+- optional limit for safe testing
+- optional folder-per-section import
 
-This is deliberately narrow:
-- one note only
-- one destination folder only
-- no hierarchy recreation yet
-- no bulk import yet
-
-Run:
+Run one note:
     python -m onenote_liberation.apple_notes_import path/to/page.metadata.json
+
+Run directory dry run:
+    python -m onenote_liberation.apple_notes_import path/to/export --dry-run
+
+Run first 5 notes:
+    python -m onenote_liberation.apple_notes_import path/to/export --limit 5
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
+import os
 import pathlib
 import subprocess
 import sys
+import tempfile
+import time
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
+
+from bs4 import BeautifulSoup
 
 
 DEFAULT_FOLDER = "OneNote Liberation Test"
+
+
+@dataclass
+class ImportItem:
+    metadata_path: pathlib.Path
+    metadata: dict[str, Any]
+    html_path: pathlib.Path
+    title: str
+    destination_folder: str
 
 
 def read_metadata(path: pathlib.Path) -> dict[str, Any]:
@@ -34,30 +55,137 @@ def read_metadata(path: pathlib.Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def find_export_root(path: pathlib.Path) -> pathlib.Path:
+    current = path if path.is_dir() else path.parent
+    for candidate in [current, *current.parents]:
+        if (candidate / "index.html").exists() or (candidate / "export_report.json").exists():
+            return candidate
+    raise FileNotFoundError("Could not find export root containing index.html or export_report.json")
+
+
 def html_path_from_metadata(metadata_path: pathlib.Path, metadata: dict[str, Any]) -> pathlib.Path:
     html_rel = metadata.get("files", {}).get("html")
     if not html_rel:
         raise ValueError("Metadata does not contain files.html")
-
-    # Metadata paths are relative to the export root. The metadata file is normally
-    # pages/<notebook>/<group>/<section>/<page>.metadata.json, so walk upward to
-    # find the export root by looking for index.html or export_report.json.
-    current = metadata_path.parent
-    for candidate in [current, *current.parents]:
-        if (candidate / "index.html").exists() or (candidate / "export_report.json").exists():
-            return candidate / html_rel
-
-    # Fallback: use parent of parent-style relative resolution.
-    return metadata_path.parent / pathlib.Path(html_rel).name
+    return find_export_root(metadata_path) / html_rel
 
 
-def import_to_apple_notes(metadata_path: pathlib.Path, folder_name: str) -> None:
-    metadata = read_metadata(metadata_path)
-    title = metadata.get("title") or "Untitled"
-    html_path = html_path_from_metadata(metadata_path, metadata)
+def metadata_files_from_input(input_path: pathlib.Path) -> list[pathlib.Path]:
+    if input_path.is_file():
+        if input_path.name.endswith(".metadata.json"):
+            return [input_path]
+        raise ValueError("Input file must be a .metadata.json file")
 
-    if not html_path.exists():
-        raise FileNotFoundError(f"HTML file not found: {html_path}")
+    if not input_path.is_dir():
+        raise FileNotFoundError(input_path)
+
+    return sorted(input_path.rglob("*.metadata.json"))
+
+
+def safe_folder_name(value: str) -> str:
+    value = value.strip()
+    value = value.replace(":", " -")
+    return value or "Untitled"
+
+
+def folder_for_metadata(metadata: dict[str, Any], root_folder: str, folder_mode: str) -> str:
+    if folder_mode == "root":
+        return root_folder
+
+    hierarchy = metadata.get("hierarchy", {})
+    section = hierarchy.get("section") or "Untitled section"
+
+    if folder_mode == "section":
+        return safe_folder_name(f"{root_folder} - {section}")
+
+    path_parts = hierarchy.get("path_parts") or []
+    if folder_mode == "path":
+        suffix = " - ".join(safe_folder_name(str(part)) for part in path_parts[1:])
+        return safe_folder_name(f"{root_folder} - {suffix}" if suffix else root_folder)
+
+    raise ValueError(f"Unknown folder mode: {folder_mode}")
+
+
+def prepare_html_for_apple_notes(html_path: pathlib.Path) -> pathlib.Path:
+    """Rewrite relative image src values to absolute file:// URIs for Apple Notes import."""
+    soup = BeautifulSoup(html_path.read_text(encoding="utf-8"), "html.parser")
+
+    for img in soup.find_all("img"):
+        src = img.get("src")
+        if not src or src.startswith("data:") or src.startswith("file://"):
+            continue
+
+        parsed = urlparse(src)
+        if parsed.scheme in {"http", "https"}:
+            continue
+
+        absolute = (html_path.parent / src).resolve()
+        if absolute.exists():
+            img["src"] = absolute.as_uri()
+
+    temp = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".html",
+        prefix="onenote_liberation_import_",
+        delete=False,
+    )
+    with temp:
+        temp.write(str(soup))
+
+    return pathlib.Path(temp.name)
+
+
+def build_import_items(
+    input_path: pathlib.Path,
+    root_folder: str,
+    folder_mode: str,
+    limit: int | None,
+) -> list[ImportItem]:
+    items: list[ImportItem] = []
+
+    for metadata_path in metadata_files_from_input(input_path):
+        metadata = read_metadata(metadata_path)
+        html_path = html_path_from_metadata(metadata_path, metadata)
+        title = metadata.get("title") or "Untitled"
+        destination_folder = folder_for_metadata(metadata, root_folder, folder_mode)
+        items.append(
+            ImportItem(
+                metadata_path=metadata_path,
+                metadata=metadata,
+                html_path=html_path,
+                title=title,
+                destination_folder=destination_folder,
+            )
+        )
+
+    if limit is not None:
+        items = items[:limit]
+
+    return items
+
+
+def run_osascript(script: str, args: list[str]) -> None:
+    completed = subprocess.run(
+        ["osascript", "-e", script, *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Apple Notes import failed.\n"
+            f"stdout:\n{completed.stdout}\n\n"
+            f"stderr:\n{completed.stderr}"
+        )
+
+
+def import_one_item(item: ImportItem) -> None:
+    if not item.html_path.exists():
+        raise FileNotFoundError(f"HTML file not found: {item.html_path}")
+
+    prepared_html = prepare_html_for_apple_notes(item.html_path)
 
     script = r'''
 on run argv
@@ -82,45 +210,92 @@ on run argv
 end run
 '''
 
-    completed = subprocess.run(
-        ["osascript", "-e", script, title, str(html_path), folder_name],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        run_osascript(script, [item.title, str(prepared_html), item.destination_folder])
+    finally:
+        try:
+            prepared_html.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "Apple Notes import failed.\n"
-            f"stdout:\n{completed.stdout}\n\n"
-            f"stderr:\n{completed.stderr}"
-        )
 
-    print("Imported one note into Apple Notes.")
-    print(f"Folder: {folder_name}")
-    print(f"Title: {title}")
-    print(f"Source HTML: {html_path}")
+def print_plan(items: list[ImportItem]) -> None:
+    print(f"Notes selected: {len(items)}")
+    for item in items:
+        print(f"- {item.title} -> {item.destination_folder}")
+        print(f"  {item.metadata_path}")
+
+
+def import_items(items: list[ImportItem], delay: float) -> None:
+    for index, item in enumerate(items, start=1):
+        print(f"[{index}/{len(items)}] Importing: {item.title} -> {item.destination_folder}")
+        import_one_item(item)
+        if delay > 0 and index < len(items):
+            time.sleep(delay)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Import one exported page into Apple Notes.")
-    parser.add_argument("metadata", help="Path to a .metadata.json file from a OneNote Liberation export.")
+    parser = argparse.ArgumentParser(description="Import OneNote Liberation exports into Apple Notes.")
+    parser.add_argument(
+        "input",
+        help="Path to either a .metadata.json file or an export directory.",
+    )
     parser.add_argument(
         "--folder",
         default=DEFAULT_FOLDER,
-        help=f"Apple Notes destination folder. Default: {DEFAULT_FOLDER}",
+        help=f"Apple Notes destination root folder. Default: {DEFAULT_FOLDER}",
+    )
+    parser.add_argument(
+        "--folder-mode",
+        choices=["root", "section", "path"],
+        default="root",
+        help=(
+            "Destination strategy: root = all notes in one folder; "
+            "section = one folder per section; path = flattened full OneNote path. Default: root."
+        ),
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Import only the first N notes. Useful for testing.",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.2,
+        help="Delay in seconds between Apple Notes imports. Default: 0.2.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be imported, but do not write to Apple Notes.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    import_to_apple_notes(pathlib.Path(args.metadata).expanduser().resolve(), args.folder)
+    input_path = pathlib.Path(args.input).expanduser().resolve()
+    items = build_import_items(input_path, args.folder, args.folder_mode, args.limit)
+
+    if not items:
+        print("No metadata files found.")
+        return
+
+    print_plan(items)
+
+    if args.dry_run:
+        print("Dry run only. Nothing was written to Apple Notes.")
+        return
+
+    import_items(items, args.delay)
+    print(f"Imported {len(items)} note(s) into Apple Notes.")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {html.escape(str(exc))}", file=sys.stderr)
         sys.exit(1)
