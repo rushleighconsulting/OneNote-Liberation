@@ -8,16 +8,8 @@ Current scope:
 - optional dry run
 - optional limit for safe testing
 - optional folder-per-section import
-- experimental image attachment support
-
-Run one note:
-    python -m onenote_liberation.apple_notes_import path/to/page.metadata.json
-
-Run directory dry run:
-    python -m onenote_liberation.apple_notes_import path/to/export --dry-run
-
-Run first 5 notes:
-    python -m onenote_liberation.apple_notes_import path/to/export --limit 5
+- experimental image attachment import
+- attachment filename normalisation using magic-byte detection
 """
 
 from __future__ import annotations
@@ -25,6 +17,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -36,9 +29,10 @@ from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
+from .assets import normalised_attachment_copy
+
 
 DEFAULT_FOLDER = "OneNote Liberation Test"
-VERSION = "0.9.0"
 
 
 @dataclass
@@ -46,6 +40,7 @@ class ImportItem:
     metadata_path: pathlib.Path
     metadata: dict[str, Any]
     html_path: pathlib.Path
+    image_paths: list[pathlib.Path]
     title: str
     destination_folder: str
 
@@ -69,6 +64,21 @@ def html_path_from_metadata(metadata_path: pathlib.Path, metadata: dict[str, Any
     if not html_rel:
         raise ValueError("Metadata does not contain files.html")
     return find_export_root(metadata_path) / html_rel
+
+
+def image_paths_from_metadata(metadata_path: pathlib.Path, metadata: dict[str, Any]) -> list[pathlib.Path]:
+    root = find_export_root(metadata_path)
+    paths: list[pathlib.Path] = []
+    for image in metadata.get("images", []) or []:
+        if image.get("status") != "downloaded":
+            continue
+        asset = image.get("asset")
+        if not asset:
+            continue
+        candidate = (root / asset).resolve()
+        if candidate.exists():
+            paths.append(candidate)
+    return paths
 
 
 def metadata_files_from_input(input_path: pathlib.Path) -> list[pathlib.Path]:
@@ -107,24 +117,8 @@ def folder_for_metadata(metadata: dict[str, Any], root_folder: str, folder_mode:
     raise ValueError(f"Unknown folder mode: {folder_mode}")
 
 
-def asset_paths_from_metadata(metadata_path: pathlib.Path, metadata: dict[str, Any]) -> list[pathlib.Path]:
-    export_root = find_export_root(metadata_path)
-    assets: list[pathlib.Path] = []
-
-    for image in metadata.get("images", []) or []:
-        if image.get("status") != "downloaded":
-            continue
-        rel = image.get("asset")
-        if not rel:
-            continue
-        path = (export_root / rel).resolve()
-        if path.exists():
-            assets.append(path)
-
-    return assets
-
-
 def prepare_html_for_apple_notes(html_path: pathlib.Path) -> pathlib.Path:
+    """Rewrite relative image src values to absolute file:// URIs for the body import attempt."""
     soup = BeautifulSoup(html_path.read_text(encoding="utf-8"), "html.parser")
 
     for img in soup.find_all("img"):
@@ -171,6 +165,7 @@ def build_import_items(
                 metadata_path=metadata_path,
                 metadata=metadata,
                 html_path=html_path,
+                image_paths=image_paths_from_metadata(metadata_path, metadata),
                 title=title,
                 destination_folder=destination_folder,
             )
@@ -182,7 +177,7 @@ def build_import_items(
     return items
 
 
-def run_osascript(script: str, args: list[str]) -> str:
+def run_osascript(script: str, args: list[str]) -> None:
     completed = subprocess.run(
         ["osascript", "-e", script, *args],
         text=True,
@@ -197,23 +192,24 @@ def run_osascript(script: str, args: list[str]) -> str:
             f"stderr:\n{completed.stderr}"
         )
 
-    return completed.stdout.strip()
-
 
 def import_one_item(item: ImportItem, attach_images: bool) -> None:
     if not item.html_path.exists():
         raise FileNotFoundError(f"HTML file not found: {item.html_path}")
 
     prepared_html = prepare_html_for_apple_notes(item.html_path)
-    image_paths = asset_paths_from_metadata(item.metadata_path, item.metadata) if attach_images else []
-    image_list = "\n".join(str(path) for path in image_paths)
+    normalised_paths: list[pathlib.Path] = []
+
+    if attach_images:
+        normalised_paths = [normalised_attachment_copy(path) for path in item.image_paths]
+
+    attachment_args = [str(path) for path in normalised_paths]
 
     script = r'''
 on run argv
     set noteTitle to item 1 of argv
     set htmlPath to item 2 of argv
     set folderName to item 3 of argv
-    set imagePathText to item 4 of argv
 
     set noteBody to read POSIX file htmlPath as «class utf8»
 
@@ -227,30 +223,22 @@ on run argv
         end if
 
         set targetFolder to folder folderName of targetAccount
-        set targetNote to make new note at targetFolder with properties {name:noteTitle, body:noteBody}
+        set newNote to make new note at targetFolder with properties {name:noteTitle, body:noteBody}
 
-        if imagePathText is not "" then
-            set AppleScript's text item delimiters to linefeed
-            set imagePaths to text items of imagePathText
-            set AppleScript's text item delimiters to ""
-
-            repeat with imagePath in imagePaths
-                if imagePath is not "" then
-                    set imageAlias to POSIX file imagePath as alias
-                    try
-                        make new attachment at targetNote with data imageAlias
-                    on error errMsg number errNo
-                        set body of targetNote to (body of targetNote) & "<br><p>[Image attachment failed: " & imagePath & "]</p>"
-                    end try
-                end if
-            end repeat
-        end if
+        repeat with i from 4 to count of argv
+            set attachmentPath to item i of argv
+            try
+                make new attachment at newNote with data (POSIX file attachmentPath as alias)
+            on error errMsg number errNum
+                set body of newNote to ((body of newNote) & "<p><strong>Image attachment failed:</strong> " & attachmentPath & " (" & errMsg & ")</p>")
+            end try
+        end repeat
     end tell
 end run
 '''
 
     try:
-        run_osascript(script, [item.title, str(prepared_html), item.destination_folder, image_list])
+        run_osascript(script, [item.title, str(prepared_html), item.destination_folder, *attachment_args])
     finally:
         try:
             prepared_html.unlink(missing_ok=True)
@@ -259,12 +247,10 @@ end run
 
 
 def print_plan(items: list[ImportItem], attach_images: bool) -> None:
-    print(f"OneNote Liberation Apple Notes importer {VERSION}")
     print(f"Notes selected: {len(items)}")
-    print(f"Attach images: {'yes' if attach_images else 'no'}")
     for item in items:
-        image_count = len(asset_paths_from_metadata(item.metadata_path, item.metadata))
-        print(f"- {item.title} -> {item.destination_folder} ({image_count} image asset(s))")
+        image_text = f", {len(item.image_paths)} image(s)" if attach_images else ""
+        print(f"- {item.title} -> {item.destination_folder}{image_text}")
         print(f"  {item.metadata_path}")
 
 
@@ -278,7 +264,10 @@ def import_items(items: list[ImportItem], delay: float, attach_images: bool) -> 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Import OneNote Liberation exports into Apple Notes.")
-    parser.add_argument("input", help="Path to either a .metadata.json file or an export directory.")
+    parser.add_argument(
+        "input",
+        help="Path to either a .metadata.json file or an export directory.",
+    )
     parser.add_argument(
         "--folder",
         default=DEFAULT_FOLDER,
@@ -293,13 +282,27 @@ def parse_args() -> argparse.Namespace:
             "section = one folder per section; path = flattened full OneNote path. Default: root."
         ),
     )
-    parser.add_argument("--limit", type=int, default=None, help="Import only the first N notes.")
-    parser.add_argument("--delay", type=float, default=0.2, help="Delay in seconds between imports.")
-    parser.add_argument("--dry-run", action="store_true", help="Show plan but do not write to Apple Notes.")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Import only the first N notes. Useful for testing.",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.2,
+        help="Delay in seconds between Apple Notes imports. Default: 0.2.",
+    )
     parser.add_argument(
         "--no-attach-images",
         action="store_true",
-        help="Do not attempt to attach exported image assets to Apple Notes.",
+        help="Do not try to add exported images as Apple Notes attachments.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be imported, but do not write to Apple Notes.",
     )
     return parser.parse_args()
 
