@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Hierarchy-aware Apple Notes importer.
+"""Hierarchy-preserving Apple Notes importer using flattened path folders.
 
-Imports a OneNote Liberation export into Apple Notes using the stored
-OneNote hierarchy:
+Apple Notes supports nested folders in the UI, but its AppleScript interface is
+not reliable when creating/addressing child folders. This importer therefore
+preserves the full OneNote hierarchy in the destination folder name:
 
-    Root folder > section group(s) > section > note
+    Root - Section Group - Section
 
-This is intentionally separate from apple_notes_import.py so the proven flat
-importer remains available.
+Example:
+    OneNote Migration - Rushleigh - Tipsy Fox
+
+This keeps the proven import behaviour and preserves context without relying on
+fragile nested-folder scripting.
 """
 
 from __future__ import annotations
@@ -15,157 +19,62 @@ from __future__ import annotations
 import argparse
 import html
 import pathlib
-import subprocess
 import sys
 import time
 
 from . import apple_notes_import as flat
-from .assets import normalised_attachment_copy
 
 
 DEFAULT_FOLDER = "OneNote Migration Candidate Tree"
 
 
+def safe_part(value: str) -> str:
+    value = str(value).strip().replace(":", " -")
+    return value or "Untitled"
+
+
 def folder_path_for_item(item: flat.ImportItem) -> list[str]:
     hierarchy = item.metadata.get("hierarchy", {})
     path_parts = hierarchy.get("path_parts") or []
-
-    # path_parts is normally: [Notebook, Section Group..., Section]
-    # Apple Notes root folder supplied by the user stands in for the notebook.
-    folder_parts = [str(part).strip() for part in path_parts[1:] if str(part).strip()]
-    return folder_parts or [item.destination_folder]
+    # path_parts normally: [Notebook, Section Group..., Section]
+    return [safe_part(part) for part in path_parts[1:] if str(part).strip()]
 
 
-def run_osascript(script: str, args: list[str]) -> None:
-    completed = subprocess.run(
-        ["osascript", "-e", script, *args],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "Apple Notes hierarchy import failed.\n"
-            f"stdout:\n{completed.stdout}\n\n"
-            f"stderr:\n{completed.stderr}"
-        )
+def flattened_folder_for_item(item: flat.ImportItem, root_folder: str) -> str:
+    parts = folder_path_for_item(item)
+    if not parts:
+        return root_folder
+    return safe_part(f"{root_folder} - {' - '.join(parts)}")
 
 
-def import_one_item_tree(item: flat.ImportItem, root_folder: str, attach_assets: bool) -> None:
-    if not item.html_path.exists():
-        raise FileNotFoundError(f"HTML file not found: {item.html_path}")
-
-    prepared_html = flat.prepare_html_for_apple_notes(item.html_path)
-    folder_parts = folder_path_for_item(item)
-
-    normalised_paths: list[pathlib.Path] = []
-    if attach_assets:
-        normalised_paths = [normalised_attachment_copy(path) for path in item.asset_paths]
-
-    script = r'''
-on findChildFolder(parentContainer, childName)
-    tell application "Notes"
-        repeat with candidateFolder in folders of parentContainer
-            if name of candidateFolder is childName then
-                return candidateFolder
-            end if
-        end repeat
-        return missing value
-    end tell
-end findChildFolder
-
-on run argv
-    set noteTitle to item 1 of argv
-    set htmlPath to item 2 of argv
-    set rootFolderName to item 3 of argv
-    set folderCount to (item 4 of argv) as integer
-
-    set noteBody to read POSIX file htmlPath as «class utf8»
-
-    tell application "Notes"
-        activate
-        set targetAccount to first account
-
-        set rootFolder to missing value
-        repeat with candidateFolder in folders of targetAccount
-            if name of candidateFolder is rootFolderName then
-                set rootFolder to candidateFolder
-                exit repeat
-            end if
-        end repeat
-
-        if rootFolder is missing value then
-            set rootFolder to make new folder at targetAccount with properties {name:rootFolderName}
-        end if
-
-        set currentContainer to rootFolder
-
-        repeat with i from 1 to folderCount
-            set childName to item (4 + i) of argv
-            set childFolder to my findChildFolder(currentContainer, childName)
-            if childFolder is missing value then
-                set childFolder to make new folder at currentContainer with properties {name:childName}
-            end if
-            set currentContainer to childFolder
-        end repeat
-
-        set attachmentStart to 5 + folderCount
-        set newNote to make new note at currentContainer with properties {name:noteTitle, body:noteBody}
-
-        if (count of argv) ≥ attachmentStart then
-            repeat with i from attachmentStart to count of argv
-                set attachmentPath to item i of argv
-                try
-                    make new attachment at newNote with data (POSIX file attachmentPath as alias)
-                on error errMsg number errNum
-                    set body of newNote to ((body of newNote) & "<p><strong>Asset attachment failed:</strong> " & attachmentPath & " (" & errMsg & ")</p>")
-                end try
-            end repeat
-        end if
-    end tell
-end run
-'''
-
-    args = [
-        item.title,
-        str(prepared_html),
-        root_folder,
-        str(len(folder_parts)),
-        *folder_parts,
-        *[str(path) for path in normalised_paths],
-    ]
-
-    try:
-        run_osascript(script, args)
-    finally:
-        try:
-            prepared_html.unlink(missing_ok=True)
-        except Exception:
-            pass
+def remap_items_to_flattened_folders(items: list[flat.ImportItem], root_folder: str) -> list[flat.ImportItem]:
+    for item in items:
+        item.destination_folder = flattened_folder_for_item(item, root_folder)
+    return items
 
 
 def print_plan(items: list[flat.ImportItem], root_folder: str, attach_assets: bool) -> None:
     print(f"Notes selected: {len(items)}")
     for item in items:
-        folders = " / ".join([root_folder, *folder_path_for_item(item)])
+        folder = flattened_folder_for_item(item, root_folder)
         asset_text = f", {flat.asset_summary(item.asset_paths)}" if attach_assets else ""
-        print(f"- {item.title} -> {folders}{asset_text}")
+        print(f"- {item.title} -> {folder}{asset_text}")
         print(f"  {item.metadata_path}")
 
 
 def import_items(items: list[flat.ImportItem], root_folder: str, delay: float, attach_assets: bool) -> None:
+    remap_items_to_flattened_folders(items, root_folder)
     for index, item in enumerate(items, start=1):
-        folders = " / ".join([root_folder, *folder_path_for_item(item)])
-        print(f"[{index}/{len(items)}] Importing: {item.title} -> {folders}")
-        import_one_item_tree(item, root_folder=root_folder, attach_assets=attach_assets)
+        print(f"[{index}/{len(items)}] Importing: {item.title} -> {item.destination_folder}")
+        flat.import_one_item(item, attach_assets=attach_assets)
         if delay > 0 and index < len(items):
             time.sleep(delay)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Import OneNote Liberation export into nested Apple Notes folders.")
+    parser = argparse.ArgumentParser(description="Import OneNote Liberation export into Apple Notes path folders.")
     parser.add_argument("input", help="Path to either a .metadata.json file or an export directory.")
-    parser.add_argument("--folder", default=DEFAULT_FOLDER, help="Apple Notes root folder.")
+    parser.add_argument("--folder", default=DEFAULT_FOLDER, help="Apple Notes root folder prefix.")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--delay", type=float, default=0.2)
     parser.add_argument("--no-attach-assets", action="store_true")
@@ -178,7 +87,6 @@ def main() -> None:
     input_path = pathlib.Path(args.input).expanduser().resolve()
     attach_assets = not args.no_attach_assets
 
-    # Use root mode here because tree placement is handled by this importer.
     items = flat.build_import_items(input_path, args.folder, "root", args.limit)
     if not items:
         print("No metadata files found.")
