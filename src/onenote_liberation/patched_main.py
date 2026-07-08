@@ -4,23 +4,106 @@ This keeps the original fast-moving prototype exporter intact while patching:
 - asset saving so downloaded resources get correct file extensions based on
   magic-byte detection rather than weak Microsoft Graph Content-Type headers
 - section page fetching so large sections are not accidentally capped at 20 pages
+- long-haul Graph behaviour for full notebook exports
 """
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import time
 from typing import Any
 
+import requests
 from bs4 import BeautifulSoup
 
 from . import main as legacy
 from .assets import detect_from_bytes
 
 
-VERSION = "0.13.2"
+VERSION = "0.14.0"
 legacy.VERSION = VERSION
+
+LONG_HAUL_MIN_DELAY = 0.5
+LONG_HAUL_COOLDOWN = 0.0
+LONG_HAUL_REQUEST_COUNT = 0
+
+
+def graph_get(
+    token: str,
+    path_or_url: str,
+    accept: str = "application/json",
+    retries: int = 16,
+    max_retry_after: int = 600,
+) -> requests.Response:
+    """More patient Graph GET for long exports.
+
+    The original exporter retried transient failures, but a full notebook export
+    can hit OneNote's per-user throttling. This version adds a small baseline
+    delay, obeys Retry-After when present, grows a session-wide cooldown after
+    429s, and retries for longer before giving up.
+    """
+    global LONG_HAUL_COOLDOWN, LONG_HAUL_REQUEST_COUNT
+
+    url = path_or_url if path_or_url.startswith("https://") else legacy.GRAPH + path_or_url
+    last_response: requests.Response | None = None
+
+    for attempt in range(1, retries + 1):
+        pause = max(LONG_HAUL_MIN_DELAY, LONG_HAUL_COOLDOWN)
+        if pause > 0:
+            time.sleep(pause)
+
+        LONG_HAUL_REQUEST_COUNT += 1
+        response = requests.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": accept,
+            },
+            timeout=120,
+        )
+        last_response = response
+
+        if response.ok:
+            if LONG_HAUL_COOLDOWN > 0:
+                LONG_HAUL_COOLDOWN = max(0.0, LONG_HAUL_COOLDOWN * 0.85 - 0.1)
+            return response
+
+        if response.status_code in legacy.TRANSIENT_STATUS_CODES and attempt < retries:
+            fallback = min(15 * attempt, 180)
+            wait = legacy.retry_after_seconds(
+                response,
+                fallback=fallback,
+                max_wait=max_retry_after,
+            )
+            if response.status_code == 429:
+                LONG_HAUL_COOLDOWN = min(max(LONG_HAUL_COOLDOWN + 1.0, 2.0), 15.0)
+                print(
+                    "Graph throttled us; "
+                    f"waiting {wait}s before retry {attempt + 1}/{retries}. "
+                    f"Session cooldown is now {LONG_HAUL_COOLDOWN:.1f}s/request."
+                )
+            else:
+                print(
+                    f"Graph returned {response.status_code}; "
+                    f"waiting {wait}s before retry {attempt + 1}/{retries}..."
+                )
+            time.sleep(wait)
+            continue
+
+        print("\nGraph request failed")
+        print(f"URL: {url}")
+        print(f"Status: {response.status_code}")
+        try:
+            print(json.dumps(response.json(), indent=2))
+        except Exception:
+            print(response.text[:2000])
+        response.raise_for_status()
+
+    assert last_response is not None
+    last_response.raise_for_status()
+    return last_response
 
 
 def download_and_rewrite_images(
@@ -62,7 +145,7 @@ def download_and_rewrite_images(
             continue
 
         try:
-            response = legacy.graph_get(
+            response = graph_get(
                 token,
                 candidate_url,
                 accept="*/*",
@@ -168,6 +251,7 @@ def export_section(
     return result
 
 
+legacy.graph_get = graph_get
 legacy.download_and_rewrite_images = download_and_rewrite_images
 legacy.export_section = export_section
 main = legacy.main
