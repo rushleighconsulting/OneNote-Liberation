@@ -8,7 +8,7 @@ Current scope:
 - optional dry run
 - optional limit for safe testing
 - optional folder-per-section import
-- experimental image attachment import
+- experimental asset attachment import
 - attachment filename normalisation using magic-byte detection
 """
 
@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
-from .assets import normalised_attachment_copy
+from .assets import detect_file, normalised_attachment_copy
 
 
 DEFAULT_FOLDER = "OneNote Liberation Test"
@@ -40,7 +40,7 @@ class ImportItem:
     metadata_path: pathlib.Path
     metadata: dict[str, Any]
     html_path: pathlib.Path
-    image_paths: list[pathlib.Path]
+    asset_paths: list[pathlib.Path]
     title: str
     destination_folder: str
 
@@ -66,17 +66,27 @@ def html_path_from_metadata(metadata_path: pathlib.Path, metadata: dict[str, Any
     return find_export_root(metadata_path) / html_rel
 
 
-def image_paths_from_metadata(metadata_path: pathlib.Path, metadata: dict[str, Any]) -> list[pathlib.Path]:
+def asset_paths_from_metadata(metadata_path: pathlib.Path, metadata: dict[str, Any]) -> list[pathlib.Path]:
+    """Return downloaded asset paths from current and future metadata shapes.
+
+    Older exports used an `images` list even when Graph returned a non-image
+    resource. Future exports may use `assets`. Support both.
+    """
     root = find_export_root(metadata_path)
     paths: list[pathlib.Path] = []
-    for image in metadata.get("images", []) or []:
-        if image.get("status") != "downloaded":
+
+    candidate_lists = []
+    candidate_lists.extend(metadata.get("assets", []) or [])
+    candidate_lists.extend(metadata.get("images", []) or [])
+
+    for asset_info in candidate_lists:
+        if asset_info.get("status") != "downloaded":
             continue
-        asset = image.get("asset")
+        asset = asset_info.get("asset") or asset_info.get("path")
         if not asset:
             continue
         candidate = (root / asset).resolve()
-        if candidate.exists():
+        if candidate.exists() and candidate not in paths:
             paths.append(candidate)
     return paths
 
@@ -165,7 +175,7 @@ def build_import_items(
                 metadata_path=metadata_path,
                 metadata=metadata,
                 html_path=html_path,
-                image_paths=image_paths_from_metadata(metadata_path, metadata),
+                asset_paths=asset_paths_from_metadata(metadata_path, metadata),
                 title=title,
                 destination_folder=destination_folder,
             )
@@ -193,15 +203,15 @@ def run_osascript(script: str, args: list[str]) -> None:
         )
 
 
-def import_one_item(item: ImportItem, attach_images: bool) -> None:
+def import_one_item(item: ImportItem, attach_assets: bool) -> None:
     if not item.html_path.exists():
         raise FileNotFoundError(f"HTML file not found: {item.html_path}")
 
     prepared_html = prepare_html_for_apple_notes(item.html_path)
     normalised_paths: list[pathlib.Path] = []
 
-    if attach_images:
-        normalised_paths = [normalised_attachment_copy(path) for path in item.image_paths]
+    if attach_assets:
+        normalised_paths = [normalised_attachment_copy(path) for path in item.asset_paths]
 
     attachment_args = [str(path) for path in normalised_paths]
 
@@ -230,7 +240,7 @@ on run argv
             try
                 make new attachment at newNote with data (POSIX file attachmentPath as alias)
             on error errMsg number errNum
-                set body of newNote to ((body of newNote) & "<p><strong>Image attachment failed:</strong> " & attachmentPath & " (" & errMsg & ")</p>")
+                set body of newNote to ((body of newNote) & "<p><strong>Asset attachment failed:</strong> " & attachmentPath & " (" & errMsg & ")</p>")
             end try
         end repeat
     end tell
@@ -246,18 +256,35 @@ end run
             pass
 
 
-def print_plan(items: list[ImportItem], attach_images: bool) -> None:
+def asset_summary(paths: list[pathlib.Path]) -> str:
+    if not paths:
+        return "0 asset(s)"
+
+    counts: dict[str, int] = {}
+    for path in paths:
+        try:
+            info = detect_file(path)
+            key = info.asset_type
+        except Exception:
+            key = "unknown"
+        counts[key] = counts.get(key, 0) + 1
+
+    parts = [f"{count} {name}" for name, count in sorted(counts.items())]
+    return f"{len(paths)} asset(s): " + ", ".join(parts)
+
+
+def print_plan(items: list[ImportItem], attach_assets: bool) -> None:
     print(f"Notes selected: {len(items)}")
     for item in items:
-        image_text = f", {len(item.image_paths)} image(s)" if attach_images else ""
-        print(f"- {item.title} -> {item.destination_folder}{image_text}")
+        asset_text = f", {asset_summary(item.asset_paths)}" if attach_assets else ""
+        print(f"- {item.title} -> {item.destination_folder}{asset_text}")
         print(f"  {item.metadata_path}")
 
 
-def import_items(items: list[ImportItem], delay: float, attach_images: bool) -> None:
+def import_items(items: list[ImportItem], delay: float, attach_assets: bool) -> None:
     for index, item in enumerate(items, start=1):
         print(f"[{index}/{len(items)}] Importing: {item.title} -> {item.destination_folder}")
-        import_one_item(item, attach_images=attach_images)
+        import_one_item(item, attach_assets=attach_assets)
         if delay > 0 and index < len(items):
             time.sleep(delay)
 
@@ -295,9 +322,14 @@ def parse_args() -> argparse.Namespace:
         help="Delay in seconds between Apple Notes imports. Default: 0.2.",
     )
     parser.add_argument(
+        "--no-attach-assets",
+        action="store_true",
+        help="Do not try to add exported images/PDFs/files as Apple Notes attachments.",
+    )
+    parser.add_argument(
         "--no-attach-images",
         action="store_true",
-        help="Do not try to add exported images as Apple Notes attachments.",
+        help="Deprecated alias for --no-attach-assets.",
     )
     parser.add_argument(
         "--dry-run",
@@ -310,20 +342,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     input_path = pathlib.Path(args.input).expanduser().resolve()
-    attach_images = not args.no_attach_images
+    attach_assets = not (args.no_attach_assets or args.no_attach_images)
     items = build_import_items(input_path, args.folder, args.folder_mode, args.limit)
 
     if not items:
         print("No metadata files found.")
         return
 
-    print_plan(items, attach_images=attach_images)
+    print_plan(items, attach_assets=attach_assets)
 
     if args.dry_run:
         print("Dry run only. Nothing was written to Apple Notes.")
         return
 
-    import_items(items, args.delay, attach_images=attach_images)
+    import_items(items, args.delay, attach_assets=attach_assets)
     print(f"Imported {len(items)} note(s) into Apple Notes.")
 
 
