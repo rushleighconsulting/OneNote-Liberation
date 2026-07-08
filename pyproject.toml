@@ -1,0 +1,16 @@
+[project]
+name = "onenote-liberation"
+version = "0.4.0"
+description = "Read-only exporter for liberating Microsoft OneNote notebooks into local HTML archives."
+requires-python = ">=3.10"
+dependencies = [
+  "msal>=1.30.0",
+  "requests>=2.32.0",
+  "beautifulsoup4>=4.12.0",
+]
+
+[project.scripts]
+onenote-liberation = "onenote_liberation.main:main"
+
+[tool.ruff]
+line-length = 100
