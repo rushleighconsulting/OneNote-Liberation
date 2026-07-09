@@ -1,7 +1,31 @@
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
 .venv/
 venv/
 .env
+.env.*
+
 .DS_Store
+
+# Local authentication/cache files
+.onenote-liberation/
+msal_token_cache.json
+*token*cache*.json
+*token*cache*.bin
+
+# Generated OneNote exports and migration test runs
 onenote_liberation_export*/
+migration-*/
+migration_*/
+object-test-*/
+checkbox-test-*/
+auth-cache-test*/
+test_*/
+
+# Generated reports/manifests inside local exports
+export_report.json
+migration_manifest.json
