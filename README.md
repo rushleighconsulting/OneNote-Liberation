@@ -6,20 +6,23 @@ A read-only exporter for liberating Microsoft OneNote notebooks into a local HTM
 
 Working migration candidate. Currently supports:
 
-- Microsoft device-code sign-in
+- Microsoft device-code sign-in with persistent MSAL token cache
 - OneNote notebook / section group / section / page traversal
 - Local HTML export
 - Nested `index.html`
 - Local image download and HTML rewriting
-- Correct image extensions using content detection rather than weak Graph headers
+- PDF and Office object download from OneNote `<object>` resources
+- Correct asset extensions using content detection rather than weak Graph headers
 - Per-page metadata JSON files
 - Sensitive-looking sections/pages skipped by default
 - Optional inclusion of sensitive-looking notes
 - Microsoft Graph throttling controls for long exports
 - Manifest creation and verification
+- Export audit reporting
 - Export HTML cleanup before import
+- OneNote checkbox state preserved as Unicode `☐` and `☑`
 - Bulk Apple Notes import
-- One-level Apple Notes hierarchy import using iCloud account targeting
+- One-level Apple Notes hierarchy import using explicit account targeting
 
 ## Safety model
 
@@ -29,12 +32,19 @@ It does **not** write to OneNote.
 
 The Apple Notes importer writes only to Apple Notes.
 
-Sensitive-looking OneNote sections/pages are skipped by default. To include them, you must pass `--include-sensitive` explicitly.
+Sensitive-looking OneNote sections/pages are skipped by default. To include them, pass `--include-sensitive` explicitly.
+
+The local Microsoft authentication cache is stored outside the repository in the user's home directory:
+
+```text
+~/.onenote-liberation/msal_token_cache.json
+```
+
+Treat this file as private. It is ignored by the repository `.gitignore`.
 
 ## Install
 
 ```bash
-cd ~/Desktop/OneNote-Liberation
 python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 ```
@@ -63,7 +73,7 @@ The exporter is read-only against OneNote. `--include-sensitive` only changes wh
 python3 -m onenote_liberation.clean_export migration-full-notebook-sensitive --provenance bottom
 ```
 
-This removes duplicate top headings, removes the exporter banner from the top of pages, trims leading empty blocks, and appends provenance at the bottom of each note.
+This removes duplicate top headings, removes the exporter banner from the top of pages, trims leading empty blocks, converts OneNote to-do tags into Unicode checkbox markers, and appends provenance at the bottom of each note.
 
 ### 3. Create and verify the migration manifest
 
@@ -72,44 +82,116 @@ python3 -m onenote_liberation.manifest create migration-full-notebook-sensitive
 python3 -m onenote_liberation.manifest verify migration-full-notebook-sensitive
 ```
 
-### 4. List Apple Notes accounts
+### 4. Audit the export
 
-Do this before importing. Apple Notes may expose Gmail/IMAP Notes before iCloud, even when iCloud is the UI default.
+```bash
+python3 -m onenote_liberation.audit migration-full-notebook-sensitive --show-pages
+```
+
+The audit reports HTML features and potential fidelity risks such as objects, embeds, iframes, checkbox inputs, and missing HTML.
+
+### 5. List Apple Notes accounts
+
+Do this before importing. Apple Notes may expose an IMAP/Gmail Notes account before iCloud, even when iCloud is the UI default.
 
 ```bash
 osascript -e 'tell application "Notes" to get name of every account'
 ```
 
-Use the iCloud account name in the import command.
+Use the desired Apple Notes account name in the import command.
 
-### 5. Import into Apple Notes
+### 6. Import into Apple Notes
 
 Recommended importer:
 
 ```bash
-python3 -m onenote_liberation.apple_notes_import_onelevel migration-full-notebook-sensitive --folder "OneNote Final iCloud" --account "YOUR_ICLOUD_ACCOUNT_NAME" --delay 0.5
-```
-
-Example:
-
-```bash
-python3 -m onenote_liberation.apple_notes_import_onelevel migration-full-notebook-sensitive --folder "OneNote Final iCloud" --account "jeremysedgley@icloud.com" --delay 0.5
+python3 -m onenote_liberation.apple_notes_import_onelevel migration-full-notebook-sensitive --folder "Imported OneNote" --account "YOUR_APPLE_NOTES_ACCOUNT" --delay 0.5
 ```
 
 The resulting Apple Notes structure is:
 
 ```text
-iCloud account
-└── OneNote Final iCloud
+Apple Notes account
+└── Imported OneNote
     ├── Personal - Recipes
-    ├── Rushleigh - Tipsy Fox
-    ├── Pub ents - Music rounds
+    ├── Work - Project Notes
+    ├── Events - Music rounds
     └── ...
 ```
 
 This one-level hierarchy is the supported Apple Notes import mode. Full deep nesting is not currently reliable through Apple Notes AppleScript.
 
-## Useful export options
+## Command reference
+
+### Exporter: `python3 -m onenote_liberation`
+
+| Switch | Meaning |
+|---|---|
+| `--output PATH` | Output directory for the local HTML archive. Default: `onenote_liberation_export`. |
+| `--section TEXT` | Export only sections whose full path contains this text. Useful for test exports. |
+| `--include-sensitive` | Include sensitive-looking sections/pages that are skipped by default. Treat the resulting export as confidential. |
+| `--no-images` | Do not download images or resources. HTML is still exported. |
+| `--skip-existing` | Skip pages where both HTML and metadata already exist. Use this to resume interrupted exports. |
+| `--image-delay SECONDS` | Delay before each image/resource download. Useful for reducing Microsoft Graph throttling. Default: `1.0`. |
+| `--max-retry-after SECONDS` | Maximum wait for one Microsoft Graph retry/backoff. Default: `180`; long migrations may use `600`. |
+
+### Cleaner: `python3 -m onenote_liberation.clean_export`
+
+| Switch | Meaning |
+|---|---|
+| `export` | Export directory to clean in place. |
+| `--provenance bottom|top|none` | Where to place OneNote Liberation provenance text. Default: `bottom`. |
+| `--limit N` | Clean at most N metadata files. Useful for testing. |
+| `--dry-run` | Show selected pages without changing files. |
+
+### Manifest: `python3 -m onenote_liberation.manifest`
+
+| Command | Meaning |
+|---|---|
+| `create EXPORT_DIR` | Create `migration_manifest.json` for an export. |
+| `verify EXPORT_DIR` | Verify the manifest against files on disk. |
+
+### Audit: `python3 -m onenote_liberation.audit`
+
+| Switch | Meaning |
+|---|---|
+| `export` | Export directory to audit. |
+| `--show-pages` | List pages with potential fidelity risks. |
+
+### Apple Notes one-level importer
+
+Command:
+
+```bash
+python3 -m onenote_liberation.apple_notes_import_onelevel EXPORT_DIR --folder "Imported OneNote" --account "YOUR_APPLE_NOTES_ACCOUNT"
+```
+
+| Switch | Meaning |
+|---|---|
+| `input` | Export directory or a single `.metadata.json` file. |
+| `--folder NAME` | Root folder to create/use in Apple Notes. |
+| `--account NAME` | Apple Notes account name. Required. List accounts with AppleScript before importing. |
+| `--limit N` | Import at most N notes. Useful for testing. |
+| `--delay SECONDS` | Delay between note imports. Default: `0.2`; larger imports may use `0.5`. |
+| `--no-attach-assets` | Do not attach downloaded assets after creating notes. |
+| `--keep-scripts` | Keep generated temporary AppleScript files for debugging. |
+| `--dry-run` | Show import plan without writing to Apple Notes. |
+
+### Older flat Apple Notes importer
+
+The original flat importer is still available:
+
+```bash
+python3 -m onenote_liberation.apple_notes_import EXPORT_DIR --folder "OneNote Flat Import" --folder-mode section
+```
+
+For real migrations, prefer:
+
+```bash
+python3 -m onenote_liberation.apple_notes_import_onelevel ...
+```
+
+## Useful export examples
 
 Export one section only:
 
@@ -126,7 +208,7 @@ python3 -m onenote_liberation --section Recipes --no-images --output test_recipe
 Slow image downloads to reduce Microsoft Graph throttling:
 
 ```bash
-python3 -m onenote_liberation --section "Take A Risk" --image-delay 3 --output test_take_a_risk
+python3 -m onenote_liberation --section "Recipes" --image-delay 3 --output test_recipes
 ```
 
 Skip pages already exported:
@@ -149,14 +231,14 @@ Treat exports created with `--include-sensitive` as confidential files. They may
 
 ## Apple Notes import notes
 
-### Use iCloud, not Gmail/IMAP Notes
+### Use an explicit Apple Notes account
 
-AppleScript may select a Gmail/IMAP Notes account if the importer uses `first account`. This can cause errors involving `IMAPFolder` or `IMAPNote` object IDs.
+AppleScript may select an IMAP/Gmail Notes account if an importer uses `first account`. This can cause errors involving IMAP object IDs.
 
 The one-level importer therefore requires an explicit Apple Notes account:
 
 ```bash
-python3 -m onenote_liberation.apple_notes_import_onelevel migration-full-notebook-sensitive --folder "OneNote Final iCloud" --account "YOUR_ICLOUD_ACCOUNT_NAME"
+python3 -m onenote_liberation.apple_notes_import_onelevel migration-full-notebook-sensitive --folder "Imported OneNote" --account "YOUR_APPLE_NOTES_ACCOUNT"
 ```
 
 ### Why one-level hierarchy?
@@ -173,7 +255,20 @@ Root folder
 
 This preserves the meaningful OneNote hierarchy while staying reliable in Apple Notes.
 
-### Diagnostic probe
+## Known limitations
+
+- Native Apple Notes checklists are not recreated. OneNote checkbox state is preserved as Unicode `☐` and `☑`, but the boxes are not interactive.
+- OneNote proprietary tags other than to-do checkboxes are not currently interpreted.
+- OneNote drawing ink is preserved only if Microsoft Graph exports it as an image.
+- Embedded Office documents are migrated as attached files rather than editable embedded objects.
+- PDF printouts are preserved as attached PDFs, not necessarily as inline page previews identical to OneNote.
+- Internal OneNote links are not rewritten to point to corresponding Apple Notes notes.
+- OneNote page versions, edit history, and author history are not migrated.
+- OneNote page colours, ruled paper, and arbitrary page canvas layout are not reproduced.
+- Complex OneNote layouts may be linearised into standard document flow.
+- Microsoft Graph rate limiting may significantly increase export time for large notebooks, although the exporter retries and can resume with `--skip-existing`.
+
+## Diagnostic probe
 
 If Apple Notes scripting behaves unexpectedly, run:
 
@@ -182,17 +277,3 @@ python3 -m onenote_liberation.notes_script_probe
 ```
 
 This writes and runs a generated `.applescript` file to test Notes folder creation.
-
-## Older flat Apple Notes importer
-
-The original flat importer is still available:
-
-```bash
-python3 -m onenote_liberation.apple_notes_import path/to/export --folder "OneNote Flat Import" --folder-mode section
-```
-
-For real migrations, prefer:
-
-```bash
-python3 -m onenote_liberation.apple_notes_import_onelevel ...
-```
