@@ -40,12 +40,13 @@ def clear_token_cache() -> None:
         pass
 
 
-def token_looks_like_jwt(token: str) -> bool:
-    return isinstance(token, str) and token.count(".") == 2
-
-
 def sign_in(reset_auth: bool = False) -> str:
-    """Return an access token, reusing a persistent MSAL cache when possible."""
+    """Return an access token, reusing a persistent MSAL cache when possible.
+
+    Do not validate the token by shape. Microsoft/MSAL may return tokens that
+    are opaque to clients. The authoritative validation is whether Graph accepts
+    the token.
+    """
     if reset_auth:
         clear_token_cache()
 
@@ -81,11 +82,4 @@ def sign_in(reset_auth: bool = False) -> str:
         print(json.dumps(result, indent=2))
         raise RuntimeError("Login failed.")
 
-    token = result["access_token"]
-    if not token_looks_like_jwt(token):
-        clear_token_cache()
-        raise RuntimeError(
-            "Microsoft returned an invalid access token. The cached token has been cleared; rerun the command to re-authenticate."
-        )
-
-    return token
+    return result["access_token"]
