@@ -6,6 +6,7 @@ This keeps the original fast-moving prototype exporter intact while patching:
 - section page fetching so large sections are not accidentally capped at 20 pages
 - long-haul Graph behaviour for full notebook exports
 - persistent MSAL authentication cache
+- OneNote object/PDF/Office resource download and HTML rewriting
 """
 
 from __future__ import annotations
@@ -114,6 +115,95 @@ def graph_get(
     return last_response
 
 
+def page_asset_dir(paths: Any, page_id: str) -> pathlib.Path:
+    folder = paths.assets / legacy.slugify(page_id.replace("!", "-"))
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def download_graph_resource(
+    token: str,
+    url: str,
+    asset_dir: pathlib.Path,
+    prefix: str,
+    index: int,
+    declared_mime_type: str,
+    paths: Any,
+) -> tuple[pathlib.Path, dict[str, Any]]:
+    response = graph_get(token, url, accept="*/*")
+    declared_content_type = response.headers.get("Content-Type", "") or declared_mime_type
+    asset_info = detect_from_bytes(response.content, declared_mime_type=declared_content_type)
+    digest = asset_info.sha256[:12]
+    asset_name = f"{prefix}-{index}-{digest}{asset_info.extension}"
+    asset_path = asset_dir / asset_name
+    asset_path.write_bytes(response.content)
+    return asset_path, {
+        "index": index,
+        "status": "downloaded",
+        "asset_type": asset_info.asset_type,
+        "mime_type": asset_info.mime_type,
+        "declared_content_type": declared_content_type,
+        "extension": asset_info.extension,
+        "sha256": asset_info.sha256,
+        "asset": str(asset_path.relative_to(paths.root)),
+    }
+
+
+def rewrite_objects(
+    token: str,
+    soup: BeautifulSoup,
+    page_output_path: pathlib.Path,
+    page_id: str,
+    paths: Any,
+    options: Any,
+) -> list[dict[str, Any]]:
+    downloaded: list[dict[str, Any]] = []
+    objects = soup.find_all("object")
+    if not objects:
+        return downloaded
+
+    asset_dir = page_asset_dir(paths, page_id)
+
+    for index, obj in enumerate(objects, start=1):
+        object_url = obj.get("data") or obj.get("src")
+        object_type = obj.get("type") or "application/octet-stream"
+        if not object_url:
+            downloaded.append({"index": index, "status": "missing object data/src"})
+            continue
+
+        if not object_url.startswith("https://graph.microsoft.com/"):
+            downloaded.append({"index": index, "status": "not downloaded (non-Graph object)", "source": object_url})
+            continue
+
+        try:
+            if options.image_delay > 0:
+                time.sleep(options.image_delay)
+            asset_path, info = download_graph_resource(
+                token,
+                object_url,
+                asset_dir,
+                "object",
+                index,
+                object_type,
+                paths,
+            )
+            info["source"] = object_url
+            info["object_type"] = object_type
+            downloaded.append(info)
+
+            relative = os.path.relpath(asset_path, start=page_output_path.parent)
+            link = soup.new_tag("a", href=relative)
+            link.string = f"Attached file: {asset_path.name}"
+            paragraph = soup.new_tag("p")
+            paragraph.append(link)
+            obj.replace_with(paragraph)
+
+        except Exception as exc:
+            downloaded.append({"index": index, "status": f"failed: {exc}", "source": object_url})
+
+    return downloaded
+
+
 def download_and_rewrite_images(
     token: str,
     soup: BeautifulSoup,
@@ -125,73 +215,46 @@ def download_and_rewrite_images(
     downloaded: list[dict[str, Any]] = []
     images = soup.find_all("img")
 
-    if not images:
-        return downloaded
-
-    if not options.include_images:
+    if options.include_images:
+        asset_dir = page_asset_dir(paths, page_id)
         for index, img in enumerate(images, start=1):
+            if options.image_delay > 0:
+                time.sleep(options.image_delay)
+
+            src = img.get("src")
+            data_fullres = img.get("data-fullres-src")
+            candidate_url = data_fullres or src
+
+            if not candidate_url:
+                downloaded.append({"index": index, "status": "missing src"})
+                continue
+
+            if candidate_url.startswith("data:"):
+                downloaded.append({"index": index, "status": "embedded data uri"})
+                continue
+
+            try:
+                asset_path, info = download_graph_resource(
+                    token,
+                    candidate_url,
+                    asset_dir,
+                    "image",
+                    index,
+                    "",
+                    paths,
+                )
+                img["src"] = os.path.relpath(asset_path, start=page_output_path.parent)
+                if img.has_attr("data-fullres-src"):
+                    del img["data-fullres-src"]
+                downloaded.append(info)
+
+            except Exception as exc:
+                downloaded.append({"index": index, "status": f"failed: {exc}", "source": candidate_url})
+    else:
+        for index, _img in enumerate(images, start=1):
             downloaded.append({"index": index, "status": "not downloaded (--no-images)"})
-        return downloaded
 
-    page_asset_dir = paths.assets / legacy.slugify(page_id.replace("!", "-"))
-    page_asset_dir.mkdir(parents=True, exist_ok=True)
-
-    for index, img in enumerate(images, start=1):
-        if options.image_delay > 0:
-            time.sleep(options.image_delay)
-
-        src = img.get("src")
-        data_fullres = img.get("data-fullres-src")
-        candidate_url = data_fullres or src
-
-        if not candidate_url:
-            downloaded.append({"index": index, "status": "missing src"})
-            continue
-
-        if candidate_url.startswith("data:"):
-            downloaded.append({"index": index, "status": "embedded data uri"})
-            continue
-
-        try:
-            response = graph_get(
-                token,
-                candidate_url,
-                accept="*/*",
-                max_retry_after=options.max_retry_after,
-            )
-            declared_content_type = response.headers.get("Content-Type", "")
-            asset_info = detect_from_bytes(response.content, declared_mime_type=declared_content_type)
-            digest = asset_info.sha256[:12]
-            asset_name = f"image-{index}-{digest}{asset_info.extension}"
-            asset_path = page_asset_dir / asset_name
-            asset_path.write_bytes(response.content)
-
-            img["src"] = os.path.relpath(asset_path, start=page_output_path.parent)
-            if img.has_attr("data-fullres-src"):
-                del img["data-fullres-src"]
-
-            downloaded.append(
-                {
-                    "index": index,
-                    "status": "downloaded",
-                    "asset_type": asset_info.asset_type,
-                    "mime_type": asset_info.mime_type,
-                    "declared_content_type": declared_content_type,
-                    "extension": asset_info.extension,
-                    "sha256": asset_info.sha256,
-                    "asset": str(asset_path.relative_to(paths.root)),
-                }
-            )
-
-        except Exception as exc:
-            downloaded.append(
-                {
-                    "index": index,
-                    "status": f"failed: {exc}",
-                    "source": candidate_url,
-                }
-            )
-
+    downloaded.extend(rewrite_objects(token, soup, page_output_path, page_id, paths, options))
     return downloaded
 
 
