@@ -5,6 +5,7 @@ Local-only command. It edits an export folder in place:
 - removes duplicate first heading matching the note title
 - removes the exporter banner near the top of the exported page
 - removes leading empty paragraphs/blocks
+- converts HTML checkbox inputs into portable Unicode checkbox marks
 - appends provenance at the bottom by default
 """
 
@@ -97,6 +98,24 @@ def remove_old_bottom_provenance(container: Tag) -> int:
     return count
 
 
+def convert_checkboxes(soup: BeautifulSoup, container: Tag) -> int:
+    """Convert HTML checkbox inputs to portable Unicode marks.
+
+    Apple Notes does not preserve arbitrary HTML input controls through the
+    AppleScript import path. Unicode checkbox glyphs are stable and searchable.
+    """
+    count = 0
+    for checkbox in list(container.find_all("input")):
+        input_type = normalise_text(str(checkbox.get("type", "")))
+        if input_type != "checkbox":
+            continue
+        checked = checkbox.has_attr("checked") or str(checkbox.get("aria-checked", "")).lower() == "true"
+        mark = "☑ " if checked else "☐ "
+        checkbox.replace_with(soup.new_string(mark))
+        count += 1
+    return count
+
+
 def append_provenance(soup: BeautifulSoup, container: Tag, metadata: dict[str, Any], mode: str) -> int:
     if mode == "none":
         return 0
@@ -141,6 +160,7 @@ def clean_one(root: pathlib.Path, metadata_path: pathlib.Path, provenance: str) 
     changes += remove_old_bottom_provenance(container)
     changes += remove_duplicate_title(container, title)
     changes += remove_leading_empty_blocks(container)
+    changes += convert_checkboxes(soup, container)
     changes += append_provenance(soup, container, metadata, provenance)
 
     if changes:
