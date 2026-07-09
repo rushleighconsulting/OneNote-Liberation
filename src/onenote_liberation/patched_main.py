@@ -5,6 +5,7 @@ This keeps the original fast-moving prototype exporter intact while patching:
   magic-byte detection rather than weak Microsoft Graph Content-Type headers
 - section page fetching so large sections are not accidentally capped at 20 pages
 - long-haul Graph behaviour for full notebook exports
+- persistent MSAL authentication cache
 """
 
 from __future__ import annotations
@@ -20,9 +21,10 @@ from bs4 import BeautifulSoup
 
 from . import main as legacy
 from .assets import detect_from_bytes
+from .auth_cache import sign_in as cached_sign_in
 
 
-VERSION = "0.14.0"
+VERSION = "0.16.0"
 legacy.VERSION = VERSION
 
 LONG_HAUL_MIN_DELAY = 0.5
@@ -37,13 +39,7 @@ def graph_get(
     retries: int = 16,
     max_retry_after: int = 600,
 ) -> requests.Response:
-    """More patient Graph GET for long exports.
-
-    The original exporter retried transient failures, but a full notebook export
-    can hit OneNote's per-user throttling. This version adds a small baseline
-    delay, obeys Retry-After when present, grows a session-wide cooldown after
-    429s, and retries for longer before giving up.
-    """
+    """More patient Graph GET for long exports."""
     global LONG_HAUL_COOLDOWN, LONG_HAUL_REQUEST_COUNT
 
     url = path_or_url if path_or_url.startswith("https://") else legacy.GRAPH + path_or_url
@@ -69,6 +65,18 @@ def graph_get(
             if LONG_HAUL_COOLDOWN > 0:
                 LONG_HAUL_COOLDOWN = max(0.0, LONG_HAUL_COOLDOWN * 0.85 - 0.1)
             return response
+
+        if response.status_code == 401:
+            print("\nGraph authentication failed")
+            print(f"URL: {url}")
+            try:
+                print(json.dumps(response.json(), indent=2))
+            except Exception:
+                print(response.text[:2000])
+            raise RuntimeError(
+                "Microsoft Graph rejected the access token. Stop this run and rerun the command; "
+                "OneNote Liberation will use the persistent MSAL cache or ask you to sign in again."
+            )
 
         if response.status_code in legacy.TRANSIENT_STATUS_CODES and attempt < retries:
             fallback = min(15 * attempt, 180)
@@ -254,4 +262,5 @@ def export_section(
 legacy.graph_get = graph_get
 legacy.download_and_rewrite_images = download_and_rewrite_images
 legacy.export_section = export_section
+legacy.sign_in = cached_sign_in
 main = legacy.main
