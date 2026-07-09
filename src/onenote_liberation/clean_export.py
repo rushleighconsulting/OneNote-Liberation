@@ -6,6 +6,7 @@ Local-only command. It edits an export folder in place:
 - removes the exporter banner near the top of the exported page
 - removes leading empty paragraphs/blocks
 - converts HTML checkbox inputs into portable Unicode checkbox marks
+- converts OneNote data-tag to-do spans into portable Unicode checkbox marks
 - appends provenance at the bottom by default
 """
 
@@ -116,6 +117,32 @@ def convert_checkboxes(soup: BeautifulSoup, container: Tag) -> int:
     return count
 
 
+def convert_onenote_todo_tags(soup: BeautifulSoup, container: Tag) -> int:
+    """Convert OneNote HTML data-tag to-do spans into Unicode checkboxes.
+
+    OneNote exports checkbox/tag items as spans such as:
+        <span data-tag="to-do">Task</span>
+        <span data-tag="to-do:completed">Task</span>
+
+    Apple Notes does not understand those OneNote-specific data tags, so convert
+    them to stable text markers while preserving the rest of the span contents.
+    """
+    count = 0
+    for tag in list(container.find_all(attrs={"data-tag": True})):
+        data_tag = normalise_text(str(tag.get("data-tag", "")))
+        if data_tag == "to-do:completed":
+            mark = "☑ "
+        elif data_tag == "to-do":
+            mark = "☐ "
+        else:
+            continue
+
+        tag.insert(0, soup.new_string(mark))
+        del tag["data-tag"]
+        count += 1
+    return count
+
+
 def append_provenance(soup: BeautifulSoup, container: Tag, metadata: dict[str, Any], mode: str) -> int:
     if mode == "none":
         return 0
@@ -161,6 +188,7 @@ def clean_one(root: pathlib.Path, metadata_path: pathlib.Path, provenance: str) 
     changes += remove_duplicate_title(container, title)
     changes += remove_leading_empty_blocks(container)
     changes += convert_checkboxes(soup, container)
+    changes += convert_onenote_todo_tags(soup, container)
     changes += append_provenance(soup, container, metadata, provenance)
 
     if changes:
