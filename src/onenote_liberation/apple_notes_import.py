@@ -127,22 +127,32 @@ def folder_for_metadata(metadata: dict[str, Any], root_folder: str, folder_mode:
     raise ValueError(f"Unknown folder mode: {folder_mode}")
 
 
+def _rewrite_relative_attr(html_path: pathlib.Path, soup: BeautifulSoup, tag_name: str, attr_name: str) -> None:
+    for tag in soup.find_all(tag_name):
+        value = tag.get(attr_name)
+        if not value or value.startswith("data:") or value.startswith("file://"):
+            continue
+
+        parsed = urlparse(value)
+        if parsed.scheme in {"http", "https", "mailto", "tel"}:
+            continue
+
+        absolute = (html_path.parent / value).resolve()
+        if absolute.exists():
+            tag[attr_name] = absolute.as_uri()
+
+
 def prepare_html_for_apple_notes(html_path: pathlib.Path) -> pathlib.Path:
-    """Rewrite relative image src values to absolute file:// URIs for the body import attempt."""
+    """Rewrite local asset references to absolute file:// URIs for Apple Notes.
+
+    Apple Notes imports HTML into an internal applewebdata:// context. Relative
+    href/src values then point at that private context rather than the export
+    folder, so local images and attachment links must be absolute file URIs.
+    """
     soup = BeautifulSoup(html_path.read_text(encoding="utf-8"), "html.parser")
 
-    for img in soup.find_all("img"):
-        src = img.get("src")
-        if not src or src.startswith("data:") or src.startswith("file://"):
-            continue
-
-        parsed = urlparse(src)
-        if parsed.scheme in {"http", "https"}:
-            continue
-
-        absolute = (html_path.parent / src).resolve()
-        if absolute.exists():
-            img["src"] = absolute.as_uri()
+    _rewrite_relative_attr(html_path, soup, "img", "src")
+    _rewrite_relative_attr(html_path, soup, "a", "href")
 
     temp = tempfile.NamedTemporaryFile(
         mode="w",
@@ -262,15 +272,12 @@ def asset_summary(paths: list[pathlib.Path]) -> str:
 
     counts: dict[str, int] = {}
     for path in paths:
-        try:
-            info = detect_file(path)
-            key = info.asset_type
-        except Exception:
-            key = "unknown"
-        counts[key] = counts.get(key, 0) + 1
+        info = detect_file(path)
+        counts[info.asset_type] = counts.get(info.asset_type, 0) + 1
 
-    parts = [f"{count} {name}" for name, count in sorted(counts.items())]
-    return f"{len(paths)} asset(s): " + ", ".join(parts)
+    bits = [f"{sum(counts.values())} asset(s)"]
+    bits.extend(f"{count} {kind}" for kind, count in sorted(counts.items()))
+    return ": ".join(bits)
 
 
 def print_plan(items: list[ImportItem], attach_assets: bool) -> None:
@@ -290,72 +297,38 @@ def import_items(items: list[ImportItem], delay: float, attach_assets: bool) -> 
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Import OneNote Liberation exports into Apple Notes.")
-    parser.add_argument(
-        "input",
-        help="Path to either a .metadata.json file or an export directory.",
-    )
-    parser.add_argument(
-        "--folder",
-        default=DEFAULT_FOLDER,
-        help=f"Apple Notes destination root folder. Default: {DEFAULT_FOLDER}",
-    )
+    parser = argparse.ArgumentParser(description="Import OneNote Liberation HTML export into Apple Notes.")
+    parser.add_argument("input", help="Path to either a .metadata.json file or an export directory.")
+    parser.add_argument("--folder", default=DEFAULT_FOLDER, help="Apple Notes destination folder/root prefix.")
     parser.add_argument(
         "--folder-mode",
         choices=["root", "section", "path"],
         default="root",
-        help=(
-            "Destination strategy: root = all notes in one folder; "
-            "section = one folder per section; path = flattened full OneNote path. Default: root."
-        ),
+        help="Folder strategy for directory imports. Default: root.",
     )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Import only the first N notes. Useful for testing.",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=0.2,
-        help="Delay in seconds between Apple Notes imports. Default: 0.2.",
-    )
-    parser.add_argument(
-        "--no-attach-assets",
-        action="store_true",
-        help="Do not try to add exported images/PDFs/files as Apple Notes attachments.",
-    )
-    parser.add_argument(
-        "--no-attach-images",
-        action="store_true",
-        help="Deprecated alias for --no-attach-assets.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be imported, but do not write to Apple Notes.",
-    )
+    parser.add_argument("--limit", type=int, default=None, help="Import at most N notes.")
+    parser.add_argument("--delay", type=float, default=0.2, help="Delay between note imports. Default: 0.2s.")
+    parser.add_argument("--no-attach-assets", action="store_true", help="Do not attach downloaded assets after creating notes.")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be imported without writing to Apple Notes.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     input_path = pathlib.Path(args.input).expanduser().resolve()
-    attach_assets = not (args.no_attach_assets or args.no_attach_images)
-    items = build_import_items(input_path, args.folder, args.folder_mode, args.limit)
+    attach_assets = not args.no_attach_assets
 
+    items = build_import_items(input_path, args.folder, args.folder_mode, args.limit)
     if not items:
         print("No metadata files found.")
         return
 
     print_plan(items, attach_assets=attach_assets)
-
     if args.dry_run:
         print("Dry run only. Nothing was written to Apple Notes.")
         return
 
-    import_items(items, args.delay, attach_assets=attach_assets)
+    import_items(items, delay=args.delay, attach_assets=attach_assets)
     print(f"Imported {len(items)} note(s) into Apple Notes.")
 
 
